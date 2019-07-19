@@ -15,6 +15,7 @@
 */
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -33,9 +34,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
     /// </summary>
     public class FineFundamentalSubscriptionEnumeratorFactory : ISubscriptionEnumeratorFactory
     {
+        private static readonly ConcurrentDictionary<int, List<DateTime>> FineFilesCache
+            = new ConcurrentDictionary<int, List<DateTime>>();
+
         private readonly bool _isLiveMode;
         private readonly Func<SubscriptionRequest, IEnumerable<DateTime>> _tradableDaysProvider;
-        private DateTime _lastUsedDate;
+        private string _lastUsedFileName;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FineFundamentalSubscriptionEnumeratorFactory"/> class.
@@ -97,68 +101,116 @@ namespace QuantConnect.Lean.Engine.DataFeeds.Enumerators.Factories
         {
             var source = fine.GetSource(config, date, _isLiveMode);
 
+            var fileName = date.ToString("yyyyMMdd");
+
             if (!File.Exists(source.Source))
             {
-                if (_lastUsedDate == default(DateTime))
+                // only use cache in backtest, since in live mode new fine files are added
+                if (!_isLiveMode)
                 {
-                    // find first file date
-                    List<string> availableFiles;
-                    try
+                    var cacheKey = config.Symbol.Value.ToLower().GetHashCode();
+                    List<DateTime> availableDates;
+                    // we still didn't load available fine dates for this symbol
+                    if (!FineFilesCache.TryGetValue(cacheKey, out availableDates))
                     {
-                        availableFiles = Directory.GetFiles(Path.GetDirectoryName(source.Source),
-                            "*.zip").OrderBy(x => x).ToList();
+                        try
+                        {
+                            var path = Path.GetDirectoryName(source.Source) ?? string.Empty;
+                            availableDates = Directory.GetFiles(path, "*.zip")
+                                .Select(
+                                    filePath =>
+                                    {
+                                        try
+                                        {
+                                            return DateTime.ParseExact(
+                                                Path.GetFileNameWithoutExtension(filePath),
+                                                "yyyyMMdd",
+                                                CultureInfo.InvariantCulture
+                                            );
+                                        }
+                                        catch
+                                        {
+                                            // just in case...
+                                            return DateTime.MaxValue;
+                                        }
+                                    }
+                                )
+                                .Where(time => time != DateTime.MaxValue)
+                                .OrderBy(x => x)
+                                .ToList();
+                        }
+                        catch
+                        {
+                            // directory doesn't exist or path is null
+                            FineFilesCache[cacheKey] = new List<DateTime>();
+                            return source;
+                        }
+                        FineFilesCache[cacheKey] = availableDates;
                     }
-                    catch
+
+                    // requested date before first date, return null source
+                    if (availableDates.Count == 0 || date < availableDates[0])
                     {
-                        // argument null exception or directory doesn't exist
                         return source;
                     }
-
-                    var fileName = Path.GetFileNameWithoutExtension(source.Source);
-
-                    // no files or requested date before first date, return null source
-                    if (availableFiles.Count == 0
-                        || string.CompareOrdinal(fileName,
-                            Path.GetFileNameWithoutExtension(availableFiles[0])) < 0)
+                    for (var i = availableDates.Count - 1; i >= 0; i--)
                     {
-                        return source;
+                        // we iterate backwards ^ and find the first data point before 'date'
+                        if (availableDates[i] <= date)
+                        {
+                            return fine.GetSource(config, availableDates[i], _isLiveMode);
+                        }
                     }
-
-                    // take advantage of the order and avoid parsing and comparing all files to get the date
-                    var index = availableFiles.BinarySearch(fileName, new FileNameComparer());
-
-                    if (index < 0)
-                    {
-                        // if negative returns the complement of the index of the next element that is larger than Date
-                        // so subtract 1 to get the previous item which is less than Date
-                        index = ~index - 1;
-                    }
-
-                    var current = DateTime.ParseExact(
-                        Path.GetFileNameWithoutExtension(availableFiles[index]),
-                        "yyyyMMdd",
-                        CultureInfo.InvariantCulture);
-
-                    if (current <= date)
-                    {
-                        // we found the file, save its date and return the source
-                        _lastUsedDate = current;
-                        return fine.GetSource(config, current, _isLiveMode);
-                    }
-
-                    // this shouldn't ever happen so throw
-                    throw new InvalidOperationException("FineFundamentalSubscriptionEnumeratorFactory.GetSource(): " +
-                                                        $"failed to resolve source for {config.Symbol} on {date}");
                 }
                 else
                 {
-                    // return source for last existing file date
-                    source = fine.GetSource(config, _lastUsedDate, _isLiveMode);
+                    if (_lastUsedFileName == null)
+                    {
+                        // find first file date
+                        var path = Path.GetDirectoryName(source.Source) ?? string.Empty;
+                        if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
+                            return source;
+
+                        var firstFileName = Path.GetFileNameWithoutExtension(Directory.GetFiles(path, "*.zip").OrderBy(x => x).First());
+                        var firstDate = DateTime.ParseExact(firstFileName, "yyyyMMdd", CultureInfo.InvariantCulture);
+
+                        // requested date before first date, return current invalid source anyway
+                        if (date < firstDate)
+                            return source;
+
+                        // requested date after first date, save date of first existing file
+                        _lastUsedFileName = firstFileName;
+
+                        // loop back in time until we find an existing file
+                        while (string.CompareOrdinal(fileName, _lastUsedFileName) > 0)
+                        {
+                            // get previous date
+                            date = date.AddDays(-1);
+
+                            // get file name for this date
+                            source = fine.GetSource(config, date, _isLiveMode);
+                            fileName = Path.GetFileNameWithoutExtension(source.Source);
+
+                            if (!File.Exists(source.Source))
+                                continue;
+
+                            // we found the file, save its name and return the source
+                            _lastUsedFileName = fileName;
+
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // return source for last existing file date
+                        date = DateTime.ParseExact(_lastUsedFileName, "yyyyMMdd", CultureInfo.InvariantCulture);
+                        source = fine.GetSource(config, date, _isLiveMode);
+                    }
                 }
             }
             else
             {
-                _lastUsedDate = date;
+                _lastUsedFileName = fileName;
             }
 
             return source;
